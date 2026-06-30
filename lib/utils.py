@@ -476,26 +476,33 @@ def save_to_csv(path, dataset, acc):
     if not path.endswith('.csv'):
         path += '.csv'
 
-    try:
-        f = open(path, 'r')
-    except:
-        f = open(path, 'w', newline='')
-        writer = csv.DictWriter(f, fieldnames=list(DATASETS.keys()))
-        writer.writerow({})
-        f.close()
-        f = open(path, 'r')
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
-    reader = csv.DictReader(f, fieldnames=list(DATASETS.keys()))
+    fieldnames = list(DATASETS.keys())
+    if dataset not in fieldnames:
+        fieldnames.append(dataset)
 
-    # Always save to the last line
-    my_dict = reader.__next__()
-    f.close()
+    my_dict = {k: '' for k in fieldnames}
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, 'r', newline='') as f:
+            # Preferred format: header + one or more rows
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        if len(rows) > 0:
+            # Always update the last row.
+            for k, v in rows[-1].items():
+                if k in my_dict:
+                    my_dict[k] = v
 
     my_dict[dataset] = acc
-    f = open(path, 'w+')
-    writer = csv.DictWriter(f, fieldnames=list(DATASETS.keys()))
-    writer.writerow(my_dict)
-    f.close()
+
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(my_dict)
 
 
 def softmax(x, t=0.0005):

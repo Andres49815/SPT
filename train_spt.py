@@ -1,11 +1,13 @@
 import argparse
 import datetime
 
+import numpy as np
 import torch.backends.cudnn as cudnn
 import json
 import yaml
 from pathlib import Path
 
+from timm.data import Mixup
 from timm.models import create_model
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.scheduler import create_scheduler
@@ -38,7 +40,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser('AutoFormer training and evaluation script', add_help=False)
     parser.add_argument('--batch-size', default=64, type=int)
     parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--model_name', required=True, type=str)
+    parser.add_argument('--model_name', default='', type=str)
 
     # custom parameters
     parser.add_argument('--platform', default='pai', type=str, choices=['itp', 'pai', 'aml'],
@@ -195,6 +197,24 @@ def get_args_parser():
     parser.add_argument('--inception',action='store_true')
     parser.add_argument('--direct_resize',action='store_true')
 
+    # Task selection
+    parser.add_argument('--task', default='classification', type=str, choices=['classification', 'segmentation'],
+                        help='Task type: classification or segmentation')
+    
+    # Segmentation parameters
+    parser.add_argument('--seg_checkpoint', default=None, type=str,
+                        help='Local path to a SAM3 checkpoint, or leave empty to use the default SAM3 checkpoint')
+    parser.add_argument('--freeze_prompt_encoder', action='store_true', default=True,
+                        help='Freeze SAM3 prompt encoder')
+    parser.add_argument('--num_seg_classes', default=1, type=int,
+                        help='Number of segmentation classes (1 for binary)')
+    parser.add_argument('--mask_loss_type', default='dice', type=str, choices=['dice', 'bce', 'bce_dice'],
+                        help='Segmentation mask loss function')
+    parser.add_argument('--seg_bce_weight', default=0.5, type=float,
+                        help='Weight for BCE loss in segmentation')
+    parser.add_argument('--seg_dice_weight', default=0.5, type=float,
+                        help='Weight for Dice loss in segmentation')
+    
     # SPT params
     parser.add_argument('--freeze_stage', action='store_true')
     parser.add_argument('--sensitivity_path', default='', type=str,)
@@ -242,8 +262,26 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
-    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args,)
-    dataset_val, _ = build_dataset(is_train=False, args=args,)
+    
+    # Load datasets based on task
+    if args.task == 'segmentation':
+        from lib.datasets_coco import build_coco_segmentation_dataset
+        dataset_train = build_coco_segmentation_dataset(
+            is_train=True,
+            data_path=args.data_path,
+            input_size=args.input_size,
+            num_classes=args.num_seg_classes,
+        )
+        dataset_val = build_coco_segmentation_dataset(
+            is_train=False,
+            data_path=args.data_path,
+            input_size=args.input_size,
+            num_classes=args.num_seg_classes,
+        )
+        args.nb_classes = args.num_seg_classes
+    else:
+        dataset_train, args.nb_classes = build_dataset(is_train=True, args=args,)
+        dataset_val, _ = build_dataset(is_train=False, args=args,)
 
     if args.distributed:
         num_tasks = utils.get_world_size()
@@ -288,7 +326,7 @@ def main(args):
     print(f"{args.data_set} dataset, train: {len(dataset_train)}, evaluation: {len(dataset_val)}")
 
     mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    mixup_active = args.task == 'classification' and (args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None)
     print('mixup_active',mixup_active)
     if mixup_active:
         mixup_fn = Mixup(
@@ -299,7 +337,16 @@ def main(args):
     if args.get_sensitivity:
 
         # Always getting sensitivity from the training split
-        dataset_sensitivity, _ = build_dataset(is_train=True, args=args, )
+        if args.task == 'segmentation':
+            dataset_sensitivity = build_coco_segmentation_dataset(
+                is_train=True,
+                data_path=args.data_path,
+                input_size=args.input_size,
+                num_classes=args.num_seg_classes,
+            )
+        else:
+            dataset_sensitivity, _ = build_dataset(is_train=True, args=args, )
+        
         sampler_init = torch.utils.data.SequentialSampler(dataset_sensitivity)
 
         data_loader_sensitivity = torch.utils.data.DataLoader(
@@ -310,121 +357,150 @@ def main(args):
             drop_last=False,
         )
 
-        model = models.__dict__[args.model_name](img_size=args.input_size,
-                                                drop_rate=args.drop,
-                                                drop_path_rate=args.drop_path,
-                                                freeze_backbone=args.freeze_stage,
-                                                num_classes=args.nb_classes
-                                                )
-    else:
-        param_info = torch.load(args.sensitivity_path, map_location='cpu')
-        tuned_vectors = param_info['tuned_vectors']
-        tuned_matrices = param_info['tuned_matrices']
-
-        print('Both structured and unstructured tuning', )
-
-        fully_fine_tuned_keys = []
-        fully_fine_tuned_keys.extend(tuned_vectors)
-        fully_fine_tuned_keys.extend(['head.weight', 'head.bias', 'cls_token'])
-
-        # Setting up unstructured tuning
-        unstructured_name_shapes = param_info['unstructured_name_shapes']
-        unstructured_indexes = param_info['unstructured_indexes']
-        unstructured_params = param_info['unstructured_params']
-
-        if unstructured_params == 0:
-            grad_mask = None
+        # Model creation based on task
+        if args.task == 'segmentation':
+            from model.sam3_wrapper import build_sam3_segmentation_model
+            model = build_sam3_segmentation_model(
+                checkpoint=args.seg_checkpoint,
+                freeze_prompt_encoder=args.freeze_prompt_encoder,
+                freeze_image_encoder=False,
+                num_classes=args.num_seg_classes,
+            )
         else:
+            model = models.__dict__[args.model_name](img_size=args.input_size,
+                                                    drop_rate=args.drop,
+                                                    drop_path_rate=args.drop_path,
+                                                    freeze_backbone=args.freeze_stage,
+                                                    num_classes=args.nb_classes
+                                                    )
+    else:
+        # Model creation based on task
+        if args.task == 'segmentation':
+            from model.sam3_wrapper import build_sam3_segmentation_model
+            model = build_sam3_segmentation_model(
+                checkpoint=args.seg_checkpoint,
+                freeze_prompt_encoder=args.freeze_prompt_encoder,
+                freeze_image_encoder=False,
+                num_classes=args.num_seg_classes,
+            )
+        else:
+            param_info = torch.load(args.sensitivity_path, map_location='cpu')
+            tuned_vectors = param_info['tuned_vectors']
+            tuned_matrices = param_info['tuned_matrices']
 
-            grad_mask = torch.cat(
-                [torch.zeros(unstructured_name_shapes[key]).flatten() for key in unstructured_name_shapes.keys()])
-            grad_mask[unstructured_indexes] = 1.
-            grad_mask = grad_mask.split([np.cumprod(list(shape))[-1] for shape in unstructured_name_shapes.values()])
-            grad_mask = {k: (mask.view(v) != 0).nonzero() for mask, (k, v) in
-                         zip(grad_mask, unstructured_name_shapes.items())}
+            print('Both structured and unstructured tuning', )
 
-        model = models.__dict__[args.model_name](img_size=args.input_size,
-                                                 drop_rate=args.drop,
-                                                 drop_path_rate=args.drop_path,
-                                                 freeze_backbone=args.freeze_stage,
-                                                 structured_list=tuned_matrices,
-                                                 tuned_vectors=tuned_vectors,
-                                                 low_rank_dim=args.low_rank_dim,
-                                                 block=args.block,
-                                                 num_classes=args.nb_classes,
-                                                 structured_type=args.structured_type,
-                                                 structured_bias=args.structured_vector,
-                                                 unstructured_indexes=grad_mask,
-                                                 unstructured_shapes=unstructured_name_shapes,
-                                                 fully_fine_tuned_keys=fully_fine_tuned_keys,
-                                                 no_structured_drop_out=args.no_structured_drop_out,
-                                                 no_structured_drop_path=args.no_structured_drop_path,
-                                                 )
+            fully_fine_tuned_keys = []
+            fully_fine_tuned_keys.extend(tuned_vectors)
+            fully_fine_tuned_keys.extend(['head.weight', 'head.bias', 'cls_token'])
+
+            # Setting up unstructured tuning
+            unstructured_name_shapes = param_info['unstructured_name_shapes']
+            unstructured_indexes = param_info['unstructured_indexes']
+            unstructured_params = param_info['unstructured_params']
+
+            if unstructured_params == 0:
+                grad_mask = None
+            else:
+
+                grad_mask = torch.cat(
+                    [torch.zeros(unstructured_name_shapes[key]).flatten() for key in unstructured_name_shapes.keys()])
+                grad_mask[unstructured_indexes] = 1.
+                grad_mask = grad_mask.split([np.cumprod(list(shape))[-1] for shape in unstructured_name_shapes.values()])
+                grad_mask = {k: (mask.view(v) != 0).nonzero() for mask, (k, v) in
+                             zip(grad_mask, unstructured_name_shapes.items())}
+
+            model = models.__dict__[args.model_name](img_size=args.input_size,
+                                                     drop_rate=args.drop,
+                                                     drop_path_rate=args.drop_path,
+                                                     freeze_backbone=args.freeze_stage,
+                                                     structured_list=tuned_matrices,
+                                                     tuned_vectors=tuned_vectors,
+                                                     low_rank_dim=args.low_rank_dim,
+                                                     block=args.block,
+                                                     num_classes=args.nb_classes,
+                                                     structured_type=args.structured_type,
+                                                     structured_bias=args.structured_vector,
+                                                     unstructured_indexes=grad_mask,
+                                                     unstructured_shapes=unstructured_name_shapes,
+                                                     fully_fine_tuned_keys=fully_fine_tuned_keys,
+                                                     no_structured_drop_out=args.no_structured_drop_out,
+                                                     no_structured_drop_path=args.no_structured_drop_path,
+                                                     )
 
     train_engine = train_one_epoch
     test_engine = evaluate
+    
+    # Use segmentation engines if segmentation task
+    if args.task == 'segmentation':
+        from lib.segmentation_engine import train_one_epoch_segmentation, evaluate_segmentation
+        train_engine = train_one_epoch_segmentation
+        test_engine = evaluate_segmentation
 
     if args.resume:
+        if args.task == 'segmentation':
+            print('Ignoring --resume for segmentation task. Use --seg_checkpoint instead.')
+        else:
         # Hard-coded pre-trained model name
-        if '.pth' in args.resume:
+            if '.pth' in args.resume:
 
-            if args.resume.endswith('mae_pretrain_vit_base.pth'):
-                state_dict = torch.load(args.resume, map_location='cpu')['model']
-                new_dict = OrderedDict()
-                for name in state_dict.keys():
-                    if 'attn.qkv.' in name:
-                        new_dict[name.replace('qkv', 'q')] = state_dict[name][:state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'k')] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'v')] = state_dict[name][-state_dict[name].shape[0] // 3:]
-                    else:
-                        new_dict[name] = state_dict[name]
+                if args.resume.endswith('mae_pretrain_vit_base.pth'):
+                    state_dict = torch.load(args.resume, map_location='cpu')['model']
+                    new_dict = OrderedDict()
+                    for name in state_dict.keys():
+                        if 'attn.qkv.' in name:
+                            new_dict[name.replace('qkv', 'q')] = state_dict[name][:state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'k')] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'v')] = state_dict[name][-state_dict[name].shape[0] // 3:]
+                        else:
+                            new_dict[name] = state_dict[name]
 
-                msg = model.load_state_dict(new_dict, strict=False)
-                print('Resuming from MAE model: ', msg)
+                    msg = model.load_state_dict(new_dict, strict=False)
+                    print('Resuming from MAE model: ', msg)
 
-            elif args.resume.endswith('linear-vit-b-300ep.pth'):
-                state_dict = torch.load(args.resume, map_location='cpu')['state_dict']
-                new_dict = OrderedDict()
-                for name in state_dict.keys():
-                    if 'attn.qkv.' in name:
-                        new_dict[name.replace('qkv', 'q').split('module.')[1]] = state_dict[name][:state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'k').split('module.')[1]] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'v').split('module.')[1]] = state_dict[name][-state_dict[name].shape[0] // 3:]
-                    elif 'head.' in name:
-                        continue
-                    else:
-                        new_dict[name.split('module.')[1]] = state_dict[name]
+                elif args.resume.endswith('linear-vit-b-300ep.pth'):
+                    state_dict = torch.load(args.resume, map_location='cpu')['state_dict']
+                    new_dict = OrderedDict()
+                    for name in state_dict.keys():
+                        if 'attn.qkv.' in name:
+                            new_dict[name.replace('qkv', 'q').split('module.')[1]] = state_dict[name][:state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'k').split('module.')[1]] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'v').split('module.')[1]] = state_dict[name][-state_dict[name].shape[0] // 3:]
+                        elif 'head.' in name:
+                            continue
+                        else:
+                            new_dict[name.split('module.')[1]] = state_dict[name]
 
-                msg = model.load_state_dict(new_dict, strict=False)
-                print('Resuming from MoCo model: ', msg)
+                    msg = model.load_state_dict(new_dict, strict=False)
+                    print('Resuming from MoCo model: ', msg)
 
-            elif args.resume.endswith('swin_base_patch4_window7_224_22k.pth'):
+                elif args.resume.endswith('swin_base_patch4_window7_224_22k.pth'):
 
-                state_dict = torch.load(args.resume, map_location='cpu')['model']
-                new_dict = OrderedDict()
-                for name in state_dict.keys():
-                    if 'attn.qkv.' in name:
-                        new_dict[name.replace('qkv', 'q')] = state_dict[name][:state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'k')] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
-                        new_dict[name.replace('qkv', 'v')] = state_dict[name][-state_dict[name].shape[0] // 3:]
-                    elif 'head.' in name:
-                        continue
-                    else:
-                        new_dict[name] = state_dict[name]
+                    state_dict = torch.load(args.resume, map_location='cpu')['model']
+                    new_dict = OrderedDict()
+                    for name in state_dict.keys():
+                        if 'attn.qkv.' in name:
+                            new_dict[name.replace('qkv', 'q')] = state_dict[name][:state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'k')] = state_dict[name][state_dict[name].shape[0] // 3:-state_dict[name].shape[0] // 3]
+                            new_dict[name.replace('qkv', 'v')] = state_dict[name][-state_dict[name].shape[0] // 3:]
+                        elif 'head.' in name:
+                            continue
+                        else:
+                            new_dict[name] = state_dict[name]
 
-                if args.nb_classes != model.head.weight.shape[0]:
-                    model.reset_classifier(args.nb_classes)
+                    if args.nb_classes != model.head.weight.shape[0]:
+                        model.reset_classifier(args.nb_classes)
 
-                msg = model.load_state_dict(new_dict, strict=False)
-                print('Resuming from Swin model: ', msg)
+                    msg = model.load_state_dict(new_dict, strict=False)
+                    print('Resuming from Swin model: ', msg)
+
+                else:
+                    raise NotImplementedError
 
             else:
-                raise NotImplementedError
-
-        else:
-            load_checkpoint(model, args.resume)
-            if args.nb_classes != model.head.weight.shape[0]:
-                model.reset_classifier(args.nb_classes)
+                load_checkpoint(model, args.resume)
+                if args.nb_classes != model.head.weight.shape[0]:
+                    model.reset_classifier(args.nb_classes)
 
     model.to(device)
     model_ema = None
@@ -433,25 +509,42 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
-    if args.mixup > 0.:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    # Create loss functions based on task
+    if args.task == 'segmentation':
+        from lib.segmentation_engine import dice_loss
+        criterion_bce = torch.nn.BCEWithLogitsLoss()
+        criterion_dice = dice_loss
+        criterion = criterion_bce  # Primary criterion for API
     else:
-        criterion = torch.nn.CrossEntropyLoss()
+        if args.mixup > 0.:
+            # smoothing is handled with mixup label transform
+            criterion = SoftTargetCrossEntropy()
+        elif args.smoothing:
+            criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+        else:
+            criterion = torch.nn.CrossEntropyLoss()
 
     if args.get_sensitivity:
-
-        get_sensitivity(
-            model, criterion, data_loader_sensitivity, device,
-            amp=args.amp, dataset=args.data_set,
-            structured_vector=args.structured_vector, low_rank_dim=args.low_rank_dim,
-            exp_name=args.exp_name, structured_type=args.structured_type,
-            alpha=args.alpha, beta=args.beta, structured_only=args.structured_only,
-            sensitivity_batch_num=args.sensitivity_batch_num
-        )
-
+        if args.task == 'segmentation':
+            from lib.segmentation_engine import get_sensitivity_segmentation
+            get_sensitivity_segmentation(
+                model, criterion_bce, criterion_dice, data_loader_sensitivity, device,
+                amp=args.amp, dataset=args.data_set,
+                structured_vector=args.structured_vector, low_rank_dim=args.low_rank_dim,
+                exp_name=args.exp_name, structured_type=args.structured_type,
+                alpha=args.alpha, beta=args.beta, structured_only=args.structured_only,
+                sensitivity_batch_num=args.sensitivity_batch_num,
+                bce_weight=args.seg_bce_weight, dice_weight=args.seg_dice_weight
+            )
+        else:
+            get_sensitivity(
+                model, criterion, data_loader_sensitivity, device,
+                amp=args.amp, dataset=args.data_set,
+                structured_vector=args.structured_vector, low_rank_dim=args.low_rank_dim,
+                exp_name=args.exp_name, structured_type=args.structured_type,
+                alpha=args.alpha, beta=args.beta, structured_only=args.structured_only,
+                sensitivity_batch_num=args.sensitivity_batch_num
+            )
         return
 
     optimizer = utils.build_optimizer(args, model_without_ddp)
@@ -468,8 +561,12 @@ def main(args):
         f.write(args_text)
 
     if args.eval:
-        test_stats = test_engine(data_loader_val, model, device, amp=args.amp)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        if args.task == 'segmentation':
+            test_stats = test_engine(data_loader_val, model, device, amp=args.amp)
+            print(f"Dice of the network on the {len(dataset_val)} validation images: {test_stats.get('dice', 0):.3f}")
+        else:
+            test_stats = test_engine(data_loader_val, model, device, amp=args.amp)
+            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
     print("Start training")
@@ -481,24 +578,42 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_stats = train_engine(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn,
-            amp=args.amp, scaler=args.scaler
-        )
+        if args.task == 'segmentation':
+            train_stats = train_engine(
+                model, criterion_bce, criterion_dice, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema,
+                amp=args.amp,
+                bce_weight=args.seg_bce_weight, dice_weight=args.seg_dice_weight
+            )
+        else:
+            train_stats = train_engine(
+                model, criterion, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                amp=args.amp, scaler=args.scaler
+            )
 
         lr_scheduler.step(epoch)
 
         if epoch % args.val_interval == 0 or epoch >= args.epochs-10:  # Evaluate more in the last a few epochs
             test_stats = test_engine(data_loader_val, model, device, amp=args.amp)
-            print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-            max_accuracy = max(max_accuracy, test_stats["acc1"])
-            print(
-                f"[{args.exp_name}] Max accuracy on the {args.data_set} dataset {len(dataset_val)} with ({args.opt}, {args.lr}, {args.weight_decay}), {max_accuracy:.2f}%")
+            
+            if args.task == 'segmentation':
+                dice = test_stats.get('dice', 0)
+                iou = test_stats.get('iou', 0)
+                print(f"Dice of the network on the {len(dataset_val)} validation images: {dice:.3f}, IoU: {iou:.3f}")
+                max_accuracy = max(max_accuracy, dice)
+                metric_name = "Dice"
+                print(f"[{args.exp_name}] Max {metric_name} on the dataset {len(dataset_val)}: {max_accuracy:.3f}")
+            else:
+                print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+                max_accuracy = max(max_accuracy, test_stats["acc1"])
+                metric_name = "Accuracy"
+                print(f"[{args.exp_name}] Max {metric_name} on the {args.data_set} dataset {len(dataset_val)} with ({args.opt}, {args.lr}, {args.weight_decay}), {max_accuracy:.2f}%")
 
             # Save to csv
-            save_to_csv('csvs/' + args.exp_name, args.data_set, "%.2f" % round(max_accuracy,2))
+            save_to_csv(args.exp_name, args.data_set, "%.2f" % round(max_accuracy,2))
 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'test_{k}': v for k, v in test_stats.items()},
