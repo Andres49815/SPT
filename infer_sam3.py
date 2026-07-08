@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
@@ -67,6 +68,24 @@ def to_normalized_box(box, w, h, box_pixels=False):
     return [x1, y1, x2, y2]
 
 
+def compute_outline(mask_np):
+    """Return a 1-pixel outline from a binary mask (uint8 0/255)."""
+    m = mask_np > 0
+    up = np.zeros_like(m)
+    down = np.zeros_like(m)
+    left = np.zeros_like(m)
+    right = np.zeros_like(m)
+
+    up[1:, :] = m[:-1, :]
+    down[:-1, :] = m[1:, :]
+    left[:, 1:] = m[:, :-1]
+    right[:, :-1] = m[:, 1:]
+
+    interior = m & up & down & left & right
+    outline = m & ~interior
+    return outline
+
+
 def main():
     args = parse_args()
 
@@ -118,11 +137,15 @@ def main():
     overlay = image.copy().convert("RGBA")
     overlay_data = overlay.load()
     mask_np = mask_bin.numpy()
+    outline_np = compute_outline(mask_np)
     for yy in range(mask_np.shape[0]):
         for xx in range(mask_np.shape[1]):
             if mask_np[yy, xx] > 0:
                 r, g, b, _ = overlay_data[xx, yy]
                 overlay_data[xx, yy] = (255, int(g * 0.5), int(b * 0.5), 255)
+            if outline_np[yy, xx]:
+                # Cyan outline for better contrast over red fill.
+                overlay_data[xx, yy] = (0, 255, 255, 255)
     overlay.save(args.output_overlay)
 
     print(f"score={scores.item():.4f}")
