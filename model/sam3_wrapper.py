@@ -60,6 +60,7 @@ class SAM3ImageSegmentationWrapper(nn.Module):
     def __init__(
         self,
         checkpoint: Optional[str] = None,
+        weights_path: Optional[str] = None,
         freeze_prompt_encoder: bool = True,
         freeze_image_encoder: bool = False,
         num_classes: int = 1,
@@ -111,6 +112,9 @@ class SAM3ImageSegmentationWrapper(nn.Module):
         if freeze_image_encoder and self.image_encoder is not None:
             for param in self.image_encoder.parameters():
                 param.requires_grad = False
+
+        if weights_path is not None:
+            self.load_finetuned_weights(weights_path)
 
     def forward(self, images: torch.Tensor, boxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -212,18 +216,29 @@ class SAM3ImageSegmentationWrapper(nn.Module):
     def get_image_encoder(self) -> nn.Module:
         return self.image_encoder
 
+    def load_finetuned_weights(self, weights_path: str) -> None:
+        """Load a fine-tuned SPT checkpoint saved from train_spt.py."""
+        state = torch.load(weights_path, map_location="cpu")
+        if isinstance(state, dict) and "model" in state:
+            state_dict = state["model"]
+        else:
+            state_dict = state
+        self.load_state_dict(state_dict, strict=False)
+
     def no_weight_decay(self):
         return {"image_encoder.patch_embed", "image_encoder.pos_embed"}
 
 
 def build_sam3_segmentation_model(
     checkpoint: Optional[str] = None,
+    weights_path: Optional[str] = None,
     freeze_prompt_encoder: bool = True,
     freeze_image_encoder: bool = False,
     num_classes: int = 1,
 ) -> SAM3ImageSegmentationWrapper:
     return SAM3ImageSegmentationWrapper(
         checkpoint=checkpoint,
+        weights_path=weights_path,
         freeze_prompt_encoder=freeze_prompt_encoder,
         freeze_image_encoder=freeze_image_encoder,
         num_classes=num_classes,

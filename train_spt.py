@@ -573,6 +573,8 @@ def main(args):
 
     start_time = time.time()
     max_accuracy = 0.0
+    best_checkpoint_path = output_dir / "checkpoint_best.pth"
+    last_checkpoint_path = output_dir / "checkpoint_last.pth"
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -614,6 +616,20 @@ def main(args):
 
             # Save to csv
             save_to_csv(args.exp_name, args.data_set, "%.2f" % round(max_accuracy,2))
+
+            if args.output_dir and utils.is_main_process():
+                checkpoint_state = {
+                    'model': model_without_ddp.state_dict(),
+                    'epoch': epoch,
+                    'args': args.__dict__,
+                    'metric': max_accuracy,
+                    'task': args.task,
+                }
+                torch.save(checkpoint_state, last_checkpoint_path)
+                if args.task == 'segmentation' and dice >= max_accuracy:
+                    torch.save(checkpoint_state, best_checkpoint_path)
+                elif args.task != 'segmentation' and test_stats.get('acc1', 0) >= max_accuracy:
+                    torch.save(checkpoint_state, best_checkpoint_path)
 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                         **{f'test_{k}': v for k, v in test_stats.items()},
