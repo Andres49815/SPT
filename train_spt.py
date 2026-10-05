@@ -534,7 +534,8 @@ def main(args):
                 exp_name=args.exp_name, structured_type=args.structured_type,
                 alpha=args.alpha, beta=args.beta, structured_only=args.structured_only,
                 sensitivity_batch_num=args.sensitivity_batch_num,
-                bce_weight=args.seg_bce_weight, dice_weight=args.seg_dice_weight
+                bce_weight=args.seg_bce_weight, dice_weight=args.seg_dice_weight,
+                output_dir=str(args.output_dir)
             )
         else:
             get_sensitivity(

@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import math
 import sys
 import random
+import json
+from pathlib import Path
 from typing import Iterable, Optional
 from lib import utils
 
@@ -237,10 +239,10 @@ def get_sensitivity_segmentation(
     data_loader: Iterable,
     device: torch.device,
     amp: bool = True,
-    dataset: str = None,
+    dataset: Optional[str] = None,
     low_rank_dim: int = 8,
     structured_vector: bool = True,
-    exp_name: str = None,
+    exp_name: Optional[str] = None,
     structured_type: str = 'lora',
     alpha: float = 5.0,
     beta: float = 5.0,
@@ -248,6 +250,7 @@ def get_sensitivity_segmentation(
     sensitivity_batch_num: int = 16,
     bce_weight: float = 0.5,
     dice_weight: float = 0.5,
+    output_dir: Optional[str] = None,
 ):
     """
     Get parameter sensitivity for segmentation task (image encoder only).
@@ -282,10 +285,13 @@ def get_sensitivity_segmentation(
     
     # Accumulate gradients on image encoder only
     grad_dict = {}
-    image_encoder = model.get_image_encoder()
+    base_model = model.module if hasattr(model, 'module') else model
+    image_encoder = getattr(base_model, 'get_image_encoder')()
+    param_numel = {}
     
     for name, param in image_encoder.named_parameters():
         grad_dict[name] = 0.0
+        param_numel[name] = int(param.numel())
     
     for idx, (images, masks, boxes) in enumerate(data_loader):
         
@@ -323,12 +329,74 @@ def get_sensitivity_segmentation(
                 if param.grad is not None:
                     grad_dict[name] += (param.grad ** 2).sum().item()
     
+    analyzed_batches = max(min(idx + 1, sensitivity_batch_num), 1)
+
     # Normalize accumulated gradients
     for key in grad_dict:
-        grad_dict[key] /= (idx + 1)
+        grad_dict[key] /= analyzed_batches
+
+    sorted_sensitivity = sorted(grad_dict.items(), key=lambda x: x[1], reverse=True)
+    top_k = 30
+    top_sensitive_params = [
+        {
+            'name': name,
+            'sensitivity': float(score),
+            'numel': param_numel[name],
+        }
+        for name, score in sorted_sensitivity[:top_k]
+    ]
+
+    total_image_encoder_params = int(sum(param_numel.values()))
+    active_param_names = [name for name, score in grad_dict.items() if score > 0.0]
+    active_tensors = len(active_param_names)
+    active_params_estimate = int(sum(param_numel[name] for name in active_param_names))
+
+    result = {
+        'dataset': dataset,
+        'exp_name': exp_name,
+        'structured_type': structured_type,
+        'low_rank_dim': low_rank_dim,
+        'alpha': alpha,
+        'beta': beta,
+        'structured_vector': structured_vector,
+        'structured_only': structured_only,
+        'sensitivity_batch_num': sensitivity_batch_num,
+        'analyzed_batches': analyzed_batches,
+        'total_image_encoder_params': total_image_encoder_params,
+        'active_tensors_estimate': active_tensors,
+        'active_params_estimate': active_params_estimate,
+        'grad_norms': {k: float(v) for k, v in grad_dict.items()},
+        'top_sensitive_params': top_sensitive_params,
+    }
     
     print('Segmentation sensitivity analysis complete')
     print('Grad norms (image encoder):', grad_dict)
+
+    if output_dir is not None and utils.is_main_process():
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        pth_path = output_path / 'segmentation_sensitivity.pth'
+        json_path = output_path / 'segmentation_sensitivity_summary.json'
+
+        torch.save(result, pth_path)
+        with json_path.open('w') as f:
+            json.dump(
+                {
+                    'dataset': result['dataset'],
+                    'exp_name': result['exp_name'],
+                    'analyzed_batches': result['analyzed_batches'],
+                    'total_image_encoder_params': result['total_image_encoder_params'],
+                    'active_tensors_estimate': result['active_tensors_estimate'],
+                    'active_params_estimate': result['active_params_estimate'],
+                    'top_sensitive_params': result['top_sensitive_params'],
+                },
+                f,
+                indent=2,
+            )
+
+        print(f'Saved segmentation sensitivity to {pth_path}')
+        print(f'Saved segmentation sensitivity summary to {json_path}')
     
     metric_logger.synchronize_between_processes()
-    return {k: v for k, v in grad_dict.items()}
+    return result
