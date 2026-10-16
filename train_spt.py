@@ -549,6 +549,19 @@ def main(args):
         return
 
     optimizer = utils.build_optimizer(args, model_without_ddp)
+    trainable_params = sum(
+        param.numel()
+        for group in optimizer.param_groups
+        for param in group['params']
+    )
+    total_params = sum(param.numel() for param in model_without_ddp.parameters())
+    if utils.is_main_process():
+        trainable_percent = 100 * trainable_params / total_params if total_params else 0
+        print(
+            f"Parameters to fine-tune: {trainable_params:,} / {total_params:,} "
+            f"({trainable_percent:.2f}%)"
+        )
+
     loss_scaler = NativeScaler()
     lr_scheduler, _ = create_scheduler(args, optimizer)
 
